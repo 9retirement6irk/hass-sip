@@ -267,6 +267,7 @@ class AssistBridge(AudioSink):
         allow_llm_hangup: bool = False,
         user_id: str | None = None,
         device_id: str | None = None,
+        on_turn_fn: Callable[[str | None, str, str], None] | None = None,
     ) -> None:
         """Initialize the Assist bridge."""
         self.hass = hass
@@ -310,6 +311,9 @@ class AssistBridge(AudioSink):
         self.allow_llm_hangup = allow_llm_hangup
         self._context = Context(user_id=user_id)
         self._device_id = device_id
+        # Called with (conversation_id, role, text) for each recognised caller
+        # utterance ("caller") and each spoken reply ("assistant").
+        self.on_turn = on_turn_fn
 
         if self.barge_in and MicroVad is None:
             LOGGER.warning(
@@ -1044,6 +1048,7 @@ class AssistBridge(AudioSink):
                 self._turn_index,
                 _stt_text(event.data),
             )
+            self._report_turn("caller", _stt_text(event.data))
             self._start_processing_cue()
         elif event.type == PipelineEventType.INTENT_END:
             if event.data:
@@ -1057,6 +1062,7 @@ class AssistBridge(AudioSink):
                     _intent_speech(intent_output),
                     self._continue_conversation,
                 )
+                self._report_turn("assistant", _intent_speech(intent_output))
         elif event.type == PipelineEventType.TTS_END:
             if event.data and (tts_output := event.data.get("tts_output")):
                 self._begin_tts_playback(tts_output["token"])
@@ -1065,6 +1071,15 @@ class AssistBridge(AudioSink):
                 self._turn_error = event.data.get("code")
             LOGGER.error("Assist pipeline error: %s", event.data)
             self._abort_streamed_tts()
+
+    def _report_turn(self, role: str, text: str) -> None:
+        """Pass one transcript line to the owner; never let it break a turn."""
+        if self.on_turn is None or not text or not text.strip():
+            return
+        try:
+            self.on_turn(self._conversation_id, role, text.strip())
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Assist transcript callback failed")
 
     def _begin_tts_playback(self, token: str | None) -> None:
         """Start RTP when Core starts streaming, or at TTS_END for regular TTS."""

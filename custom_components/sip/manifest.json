@@ -3,6 +3,7 @@
   "name": "SIP Client",
   "after_dependencies": [
     "assist_pipeline",
+    "frontend",
     "stt"
   ],
   "categories": [
@@ -16,14 +17,16 @@
   "config_flow": true,
   "dependencies": [
     "ffmpeg",
+    "http",
     "llm",
     "logbook",
     "media_source",
-    "tts"
+    "tts",
+    "websocket_api"
   ],
-  "documentation": "https://github.com/eigger/hass-sip",
+  "documentation": "https://github.com/9retirement6irk/hass-sip",
   "integration_type": "hub",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/eigger/hass-sip/issues",
+  "issue_tracker": "https://github.com/9retirement6irk/hass-sip/issues",
   "version": "3.7.3"
 }

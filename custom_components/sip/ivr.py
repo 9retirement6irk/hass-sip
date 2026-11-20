@@ -60,6 +60,7 @@ ASSIST_OPTION_FIELDS: dict[Any, Any] = {
     vol.Optional("max_turns"): vol.All(vol.Coerce(int), vol.Range(min=0)),
     vol.Optional("max_silent_turns"): vol.All(vol.Coerce(int), vol.Range(min=1)),
     vol.Optional("barge_in"): vol.Boolean(),
+    vol.Optional("listen_while_speaking"): vol.Boolean(),
     vol.Optional("silence_seconds"): vol.All(
         vol.Coerce(float), vol.Range(min=0.3, max=5.0)
     ),

@@ -85,6 +85,12 @@
     },
     "media_url_prepare_failed": {
       "message": "Failed to prepare media URL {url}: {error}"
+    },
+    "bridge_needs_two_lines": {
+      "message": "Target at least two SIP phone lines to conference them."
+    },
+    "bridge_not_in_call": {
+      "message": "Every targeted SIP line must be in an active call to be conferenced."
     }
   },
   "entity": {
@@ -295,6 +301,10 @@
           "name": "Barge-in",
           "description": "Allow interrupting TTS responses by speaking (requires pymicro_vad; default false; may self-trigger on speakerphones without echo cancellation)."
         },
+        "listen_while_speaking": {
+          "name": "Listen while speaking",
+          "description": "Keep listening while Assist talks, without interrupting it. Speech the caller starts during a reply is kept and answered once the reply has finished; noise never cuts a reply short. Takes precedence over barge-in (requires pymicro_vad; default false)."
+        },
         "silence_seconds": {
           "name": "Silence timeout",
           "description": "Seconds of silence that end a spoken command. Assist defaults to 0.7; phone lines usually need 1.0-1.5 so callers are not cut off mid-sentence."
@@ -344,6 +354,14 @@
           "description": "Optional DTMF PIN. The caller must enter it (end with # or the PIN length) before Assist starts. Failed or timed-out attempts fire sip_assist_rejected and do not run intents."
         }
       }
+    },
+    "bridge": {
+      "name": "Conference lines",
+      "description": "Merges the active calls of two or more phone lines into one conference."
+    },
+    "unbridge": {
+      "name": "Split conference",
+      "description": "Takes the targeted phone lines out of any conference; their calls stay connected."
     }
   },
   "issues": {

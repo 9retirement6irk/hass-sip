@@ -32,6 +32,8 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.service import async_extract_config_entry_ids
 
+from homeassistant.components.assist_pipeline import async_get_pipeline
+
 from .assist import AssistBridge
 from .assist_gate import (
     REASON_NOT_ALLOWED,
@@ -71,6 +73,7 @@ from .const import (
     EVENT_SIP_RECORDING_STOPPED,
     EVENT_SIP_STATE_CHANGED,
     LOGGER,
+    EVENT_SIP_LIVE_TRANSCRIPT,
 )
 from .helpers import (
     async_resolve_playback_url,
@@ -90,6 +93,7 @@ from .repairs import (
     should_open_auth_repair,
 )
 from .listen import async_setup_listen
+from .live_transcript import LiveTranscriber
 from .sip_client.audio import FfmpegAudioSource
 from .sip_client.bridge import CallBridge
 from .sip_client.sip_client import SipCallbacks, SipClient, SipConfig, SipState
@@ -294,6 +298,14 @@ SERVICE_RECORDING_SCHEMA = cv.make_entity_service_schema(
 )
 
 SERVICE_GENERIC_SCHEMA = cv.make_entity_service_schema({})
+
+SERVICE_START_TRANSCRIPTION_SCHEMA = cv.make_entity_service_schema(
+    {
+        vol.Optional("pipeline_id"): cv.string,
+        vol.Optional("stt_engine"): cv.string,
+        vol.Optional("language"): cv.string,
+    }
+)
 
 SERVICE_TRANSCRIPT_SCHEMA = cv.make_entity_service_schema(
     {vol.Optional("conversation_id"): cv.string}
@@ -562,6 +574,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             assist_bridge = None
         recorder = close_recorder_slot(entry.runtime_data)
         client.clear_sinks()
+        stop_fn = entry.runtime_data.get("stop_transcription_fn")
+        if stop_fn is not None:
+            stop_fn()
         # A conference ends for this line when its call does; the other
         # line's call carries on by itself.
         _stop_bridges_for(hass, client)
@@ -727,6 +742,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         max_silent_turns: int = 2,
         barge_in: bool = False,
         listen_while_speaking: bool = False,
+        interrupt_on_words: int = 0,
         silence_seconds: float | None = None,
         noise_suppression: int = 0,
         turn_tone: bool = False,
@@ -755,6 +771,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             max_silent_turns=max_silent_turns,
             barge_in=barge_in,
             listen_while_speaking=listen_while_speaking,
+            interrupt_on_words=interrupt_on_words,
             silence_seconds=silence_seconds,
             noise_suppression=noise_suppression,
             turn_tone=turn_tone,
@@ -792,8 +809,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         client.add_sink(assist_bridge)
         assist_bridge.start()
 
+    live_transcriber: LiveTranscriber | None = None
+
+    @callback
+    def on_live_caption(text: str) -> None:
+        """One phrase from the far end was transcribed."""
+        over_reply = (
+            assist_bridge.on_live_caption(text) if assist_bridge is not None else False
+        )
+        captions = entry.runtime_data.setdefault("captions", [])
+        captions.append(
+            {
+                "text": text,
+                "time": datetime.datetime.now(datetime.UTC).isoformat(),
+                "over_reply": over_reply,
+            }
+        )
+        del captions[:-_TRANSCRIPT_MAX_TURNS]
+        data: dict[str, Any] = {
+            "sip_account": sip_config.username,
+            "entry_id": entry.entry_id,
+            "text": text,
+            "over_reply": over_reply,
+        }
+        device_id = _sip_device_id(hass, entry.entry_id)
+        if device_id:
+            data["device_id"] = device_id
+        hass.bus.async_fire(EVENT_SIP_LIVE_TRANSCRIPT, data)
+
+    @callback
+    def stop_transcription() -> None:
+        nonlocal live_transcriber
+        if live_transcriber is not None:
+            client.remove_rx_tap(live_transcriber.feed)
+            live_transcriber.close()
+            live_transcriber = None
+
+    @callback
+    def start_transcription(stt_engine: str, language: str) -> None:
+        nonlocal live_transcriber
+        stop_transcription()
+        entry.runtime_data["captions"] = []
+        live_transcriber = LiveTranscriber(
+            hass,
+            stt_engine,
+            language,
+            on_live_caption,
+            sample_rate=client.codec.sample_rate,
+        )
+        client.add_rx_tap(live_transcriber.feed)
+
     # Keep a dict of active IVR/Assist objects we can update
     entry_data = entry.runtime_data
+    entry_data["start_transcription_fn"] = start_transcription
+    entry_data["stop_transcription_fn"] = stop_transcription
 
     def set_ivr(session: IvrSession | None) -> None:
         nonlocal ivr_session
@@ -849,6 +918,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry_data = getattr(entry, "runtime_data", None)
     LOGGER.info("Unloading SIP account %s", entry.data.get(CONF_USERNAME))
     if entry_data:
+        if entry_data.get("stop_transcription_fn") is not None:
+            entry_data["stop_transcription_fn"]()
         if entry_data.get("client") is not None:
             _stop_bridges_for(hass, entry_data["client"])
         await _async_stop_client(entry_data)
@@ -882,6 +953,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "bridge",
                 "unbridge",
                 "get_transcript",
+                "start_transcription",
+                "stop_transcription",
             ]:
                 try:
                     hass.services.async_remove(DOMAIN, service)
@@ -1225,6 +1298,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 "max_silent_turns",
                 "barge_in",
                 "listen_while_speaking",
+                "interrupt_on_words",
                 "silence_seconds",
                 "noise_suppression",
                 "turn_tone",
@@ -1298,7 +1372,33 @@ async def async_register_services(hass: HomeAssistant) -> None:
         return {
             "conversation_id": transcript.get("conversation_id"),
             "turns": [dict(turn) for turn in transcript["turns"]],
+            "captions": [dict(c) for c in data.get("captions", [])],
         }
+
+    async def handle_start_transcription(call: ServiceCall) -> None:
+        """Start live captions of the far end on the targeted lines."""
+        stt_engine = call.data.get("stt_engine")
+        language = call.data.get("language")
+        if not stt_engine:
+            pipeline = async_get_pipeline(hass, call.data.get("pipeline_id"))
+            stt_engine = pipeline.stt_engine
+            language = language or pipeline.stt_language
+        if not stt_engine:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="transcription_no_stt"
+            )
+        for _entry_id, data in await get_client_entries(call):
+            client: SipClient = data["client"]
+            if not client.in_call:
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN,
+                    translation_key="transcription_not_in_call",
+                )
+            data["start_transcription_fn"](stt_engine, language or "en")
+
+    async def handle_stop_transcription(call: ServiceCall) -> None:
+        for _entry_id, data in await get_client_entries(call):
+            data["stop_transcription_fn"]()
 
     async def handle_bridge(call: ServiceCall) -> None:
         """Conference the active calls of two or more lines together."""
@@ -1340,6 +1440,18 @@ async def async_register_services(hass: HomeAssistant) -> None:
         handle_get_transcript,
         schema=SERVICE_TRANSCRIPT_SCHEMA,
         supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        "start_transcription",
+        handle_start_transcription,
+        schema=SERVICE_START_TRANSCRIPTION_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        "stop_transcription",
+        handle_stop_transcription,
+        schema=SERVICE_GENERIC_SCHEMA,
     )
     hass.services.async_register(
         DOMAIN, "bridge", handle_bridge, schema=SERVICE_GENERIC_SCHEMA

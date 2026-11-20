@@ -606,3 +606,10 @@ action:
               data:
                 url: "/media/voicemails/last_msg.wav"
 ```
+
+## Scam Bot call card
+
+[`examples/scam-bot/`](../examples/scam-bot/) has a dashboard card for running an Assist
+persona that keeps phone scammers talking: one tab per line with the call as a chat, Call,
+private instructions, End call, Conference and Listen in. Setup and options are in its
+[README](../examples/scam-bot/README.md).

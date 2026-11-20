@@ -31,7 +31,9 @@ class CallMonitor:
     def __init__(self, client: SipClient) -> None:
         self._client = client
         self._listeners: list[MonitorListener] = []
-        self._rx = MixInputs(max_frames=10, prime_frames=2)
+        # A listener only hears the call, so trade 60 ms of delay for fewer
+        # dropouts when the far end's packets arrive unevenly.
+        self._rx = MixInputs(max_frames=12, prime_frames=3)
         self._attached = False
 
     @property

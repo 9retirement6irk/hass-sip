@@ -75,6 +75,7 @@ ASSIST_OPTION_FIELDS: dict[Any, Any] = {
     vol.Optional("hangup_on_end"): vol.Boolean(),
     vol.Optional("allow_llm_hangup", default=False): vol.Boolean(),
     vol.Optional("interrupt_media", default=True): vol.Boolean(),
+    vol.Optional("include_call_start"): vol.Boolean(),
 }
 _ASSIST_OPTION_VALIDATORS: dict[str, Any] = {
     str(key): validator for key, validator in ASSIST_OPTION_FIELDS.items()

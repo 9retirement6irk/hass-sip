@@ -59,6 +59,8 @@ SERVICES = {
     "bridge",
     "unbridge",
     "get_transcript",
+    "start_transcription",
+    "stop_transcription",
 }
 
 # (platform, unique-id suffix) for every entity the account creates.

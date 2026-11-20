@@ -255,6 +255,16 @@ start_assist:
       default: false
       selector:
         boolean:
+    interrupt_on_words:
+      name: Interrupt after words
+      description: With live transcription running, stop a reply once the caller has said this many recognised words over it (0 = never). Unlike barge-in this needs real words, so noise cannot cut a reply short.
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 50
+          mode: box
     silence_seconds:
       name: Silence timeout
       description: Seconds of silence that end a spoken command. Assist defaults to 0.7; phone lines usually need 1.0-1.5 so callers are not cut off mid-sentence.
@@ -379,3 +389,39 @@ get_transcript:
       required: false
       selector:
         text:
+
+start_transcription:
+  name: Start live transcription
+  description: Transcribe what the far end says, phrase by phrase, for the rest of the call - also while Assist is replying. Each phrase fires a sip_live_transcript event, is returned by Get transcript, and phrases said over an Assist reply are passed to its next turn.
+  target:
+    entity:
+      integration: sip
+      domain: media_player
+  fields:
+    pipeline_id:
+      name: Assist pipeline
+      description: Use this pipeline's speech-to-text engine and language (the preferred pipeline when empty).
+      required: false
+      selector:
+        assist_pipeline:
+    stt_engine:
+      name: Speech-to-text entity
+      description: Optional. A specific stt entity to use instead of the pipeline's.
+      required: false
+      selector:
+        entity:
+          domain: stt
+    language:
+      name: Language
+      description: Optional language code, e.g. en.
+      required: false
+      selector:
+        text:
+
+stop_transcription:
+  name: Stop live transcription
+  description: Stop live transcription on the targeted phone lines (it also stops when the call ends).
+  target:
+    entity:
+      integration: sip
+      domain: media_player

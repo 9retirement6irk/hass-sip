@@ -252,6 +252,7 @@ class AssistBridge(AudioSink):
         max_silent_turns: int = 2,
         barge_in: bool = False,
         listen_while_speaking: bool = False,
+        interrupt_on_words: int = 0,
         silence_seconds: float | None = None,
         noise_suppression: int = 0,
         turn_tone: bool = False,
@@ -290,6 +291,13 @@ class AssistBridge(AudioSink):
         self.listen_while_speaking = listen_while_speaking
         self.barge_in = barge_in or listen_while_speaking
         self._overlap_capture = False
+        # Live captions (see live_transcript.py) heard while this side was
+        # busy replying; handed to the next turn as text. With
+        # ``interrupt_on_words`` > 0 a reply is cut short once the caller has
+        # said that many recognised words over it.
+        self.interrupt_on_words = max(0, int(interrupt_on_words or 0))
+        self._overheard: list[str] = []
+        self._stt_done = False
         self.silence_seconds = silence_seconds
         self.noise_suppression = noise_suppression
         self.turn_tone = turn_tone
@@ -639,6 +647,55 @@ class AssistBridge(AudioSink):
         self._overlap_capture = True
         self._post_barge_in_capture = True
 
+    def on_live_caption(self, text: str) -> bool:
+        """Take one live caption; True when it was said over a reply.
+
+        Captions that arrive while a turn is still listening are that turn's
+        own speech and reach the agent through STT as usual. Anything said
+        after STT closed (while thinking or replying) is kept as text for the
+        next turn, and may cut a long reply short.
+        """
+        if not self._running or not text:
+            return False
+        if self._listening and not self._stt_done and not self._speaking:
+            return False
+        self._overheard.append(text)
+        del self._overheard[:-20]
+        if (
+            self.interrupt_on_words
+            and self._speaking
+            and not (self._processing_playing or self._cue_handover)
+            and sum(len(t.split()) for t in self._overheard) >= self.interrupt_on_words
+        ):
+            self._interrupt_for_caller()
+        return True
+
+    def _interrupt_for_caller(self) -> None:
+        """Stop the reply because the caller is saying something substantial."""
+        LOGGER.info("Assist: caller is talking over the reply; stopping it")
+        self._cancel_inflight_tts(stop_audio=True)
+        if not self._post_barge_in_capture:
+            self._barge_in_preroll = bytes(self._ring_buffer)[-_PREROLL_MAX_BYTES:]
+            self._ring_buffer.clear()
+            self._post_barge_in_capture = True
+        self._vad_pending.clear()
+        self._vad_speech_frames = 0
+        self._tx_done.set()
+
+    def _turn_system_prompt(self) -> str | None:
+        """System prompt for the next turn, plus what was said over the last reply."""
+        if not self._overheard:
+            return self.system_prompt
+        heard = " ".join(self._overheard)
+        self._overheard = []
+        note = (
+            "LIVE CAPTIONS (automatic, may contain small errors): while you were "
+            f'speaking or thinking just now, the caller said: "{heard}". You may '
+            "hear some of this again at the start of their next words; treat it "
+            "as said once. Take it into account in your reply."
+        )
+        return f"{self.system_prompt} {note}" if self.system_prompt else note
+
     def _build_audio_settings(self) -> AudioSettings | None:
         """Return pipeline audio settings, or None to keep Assist defaults.
 
@@ -708,6 +765,7 @@ class AssistBridge(AudioSink):
                 self.audio_stream = AssistAudioStream()
                 self._turn_error = None
                 self._continue_conversation = False
+                self._stt_done = False
                 self._turn_index = turns + 1
                 # Barge-in already has the caller talking; skip the beep so it
                 # does not talk over them. Gap preroll after TTS must not skip
@@ -739,7 +797,7 @@ class AssistBridge(AudioSink):
                         audio_settings=audio_settings,
                         start_stage=PipelineStage.STT,
                         end_stage=PipelineStage.TTS,
-                        conversation_extra_system_prompt=self.system_prompt,
+                        conversation_extra_system_prompt=self._turn_system_prompt(),
                         device_id=self._device_id,
                     )
                 finally:
@@ -1048,6 +1106,7 @@ class AssistBridge(AudioSink):
                 self._turn_index,
                 _stt_text(event.data),
             )
+            self._stt_done = True
             self._report_turn("caller", _stt_text(event.data))
             self._start_processing_cue()
         elif event.type == PipelineEventType.INTENT_END:

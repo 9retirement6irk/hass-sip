@@ -91,6 +91,12 @@
     },
     "bridge_not_in_call": {
       "message": "Every targeted SIP line must be in an active call to be conferenced."
+    },
+    "transcription_no_stt": {
+      "message": "The Assist pipeline has no speech-to-text engine for live transcription."
+    },
+    "transcription_not_in_call": {
+      "message": "Live transcription needs an active call on the SIP line."
     }
   },
   "entity": {
@@ -352,6 +358,10 @@
         "pin": {
           "name": "PIN",
           "description": "Optional DTMF PIN. The caller must enter it (end with # or the PIN length) before Assist starts. Failed or timed-out attempts fire sip_assist_rejected and do not run intents."
+        },
+        "interrupt_on_words": {
+          "name": "Interrupt after words",
+          "description": "With live transcription running, stop a reply once the caller has said this many recognised words over it (0 = never)."
         }
       }
     },
@@ -372,6 +382,28 @@
           "description": "Only return the transcript if it belongs to this conversation."
         }
       }
+    },
+    "start_transcription": {
+      "name": "Start live transcription",
+      "description": "Transcribes what the far end says, phrase by phrase, for the rest of the call.",
+      "fields": {
+        "pipeline_id": {
+          "name": "Assist pipeline",
+          "description": "Use this pipeline's speech-to-text engine and language."
+        },
+        "stt_engine": {
+          "name": "Speech-to-text entity",
+          "description": "A specific stt entity to use instead of the pipeline's."
+        },
+        "language": {
+          "name": "Language",
+          "description": "Language code, e.g. en."
+        }
+      }
+    },
+    "stop_transcription": {
+      "name": "Stop live transcription",
+      "description": "Stops live transcription on the targeted phone lines."
     }
   },
   "issues": {

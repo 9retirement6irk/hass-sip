@@ -66,6 +66,8 @@ _monotonic = time.monotonic  # patched in tests without touching the event loop
 _GAP_MIN_SPEECH_FRAMES = 5  # 50 ms consecutive speech
 _PREROLL_BYTES_PER_SECOND = 32000  # 16 kHz s16le mono
 _PREROLL_MAX_BYTES = 16000  # 500 ms @ 16 kHz s16le mono
+# listen_while_speaking: at most this much caller audio is kept per reply.
+_OVERLAP_CAPTURE_MAX_BYTES = 20 * _PREROLL_BYTES_PER_SECOND
 _TX_IDLE_TIMEOUT_SECONDS = 60.0
 _TONE_WAIT_TIMEOUT_SECONDS = 3
 # A caller-configured tone media clip may run longer than the synthesized
@@ -249,6 +251,7 @@ class AssistBridge(AudioSink):
         max_turns: int = 0,
         max_silent_turns: int = 2,
         barge_in: bool = False,
+        listen_while_speaking: bool = False,
         silence_seconds: float | None = None,
         noise_suppression: int = 0,
         turn_tone: bool = False,
@@ -280,7 +283,12 @@ class AssistBridge(AudioSink):
             self.max_silent_turns = min(
                 self.max_silent_turns, _HANGUP_ON_END_MAX_SILENT_TURNS
             )
-        self.barge_in = barge_in
+        # ``listen_while_speaking`` is barge-in detection without the
+        # interruption: caller speech heard during a reply is captured and
+        # handed to the next turn once the reply has finished playing.
+        self.listen_while_speaking = listen_while_speaking
+        self.barge_in = barge_in or listen_while_speaking
+        self._overlap_capture = False
         self.silence_seconds = silence_seconds
         self.noise_suppression = noise_suppression
         self.turn_tone = turn_tone
@@ -303,11 +311,12 @@ class AssistBridge(AudioSink):
         self._context = Context(user_id=user_id)
         self._device_id = device_id
 
-        if barge_in and MicroVad is None:
+        if self.barge_in and MicroVad is None:
             LOGGER.warning(
                 "pymicro_vad unavailable; barge-in disabled for this session"
             )
             self.barge_in = False
+            self.listen_while_speaking = False
 
         self.audio_stream = AssistAudioStream()
         self.session_task: asyncio.Task | None = None
@@ -389,6 +398,7 @@ class AssistBridge(AudioSink):
         self._listening = False
         self._speaking = False
         self._post_barge_in_capture = False
+        self._overlap_capture = False
         self._run_tts_token = None
         self._playing_tts_token = None
         self._cancel_inflight_tts()
@@ -463,7 +473,11 @@ class AssistBridge(AudioSink):
     def _append_rx_to_ring(self, pcm_16k: bytes) -> None:
         self._ring_buffer.extend(pcm_16k)
         limit = _PREROLL_MAX_BYTES
-        if self.barge_in and self._speaking:
+        if self._overlap_capture:
+            # The reply keeps playing; keep everything the caller says until
+            # it ends (bounded so a very long reply cannot grow without limit).
+            limit = _OVERLAP_CAPTURE_MAX_BYTES
+        elif self.barge_in and self._speaking:
             # VAD is held off during the grace window, so keep that audio too:
             # speech that began inside it must still reach STT on barge-in.
             limit += int(_BARGE_IN_VAD_GRACE_SECONDS * _PREROLL_BYTES_PER_SECOND)
@@ -494,6 +508,7 @@ class AssistBridge(AudioSink):
             preroll = ring
         self._barge_in_preroll = b""
         self._post_barge_in_capture = False
+        self._overlap_capture = False
         self._reset_barge_in_state()
         return preroll
 
@@ -571,7 +586,10 @@ class AssistBridge(AudioSink):
             if self._micro_vad.Process10ms(frame) >= _VAD_SPEECH_THRESHOLD:
                 self._vad_speech_frames += 1
                 if self._vad_speech_frames >= _VAD_MIN_SPEECH_FRAMES:
-                    self._on_barge_in()
+                    if self.listen_while_speaking:
+                        self._on_overlap_speech()
+                    else:
+                        self._on_barge_in()
                     return
             else:
                 self._vad_speech_frames = 0
@@ -593,6 +611,29 @@ class AssistBridge(AudioSink):
         self._ring_buffer.clear()
         self._post_barge_in_capture = True
         self._tx_done.set()
+
+    def _on_overlap_speech(self) -> None:
+        """Caller spoke during the reply: keep it, but let the reply finish.
+
+        Same bookkeeping as a barge-in, minus cancelling TTS and releasing
+        the playback wait. ``write()`` keeps appending RX to the ring until
+        the reply ends, and the next turn starts with that audio as preroll,
+        so the caller is answered instead of being talked over and ignored.
+        Noise that the VAD does not classify as speech never gets here, so it
+        can no longer cut a reply short.
+        """
+        LOGGER.info("Assist: caller spoke during reply; holding it for the next turn")
+        preroll = bytes(self._ring_buffer)
+        armed_at = self._tts_armed_at
+        grace_tail = _BARGE_IN_VAD_GRACE_SECONDS + _VAD_MIN_SPEECH_FRAMES * 0.01
+        if armed_at is None or _monotonic() - armed_at > grace_tail + 0.5:
+            preroll = preroll[-_PREROLL_MAX_BYTES:]
+        self._barge_in_preroll = preroll
+        self._vad_pending.clear()
+        self._vad_speech_frames = 0
+        self._ring_buffer.clear()
+        self._overlap_capture = True
+        self._post_barge_in_capture = True
 
     def _build_audio_settings(self) -> AudioSettings | None:
         """Return pipeline audio settings, or None to keep Assist defaults.

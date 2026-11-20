@@ -25,6 +25,7 @@ from typing import Callable
 from . import codecs
 from . import trace
 from .codecs import Codec
+from .mixing import MixInputs, mix_pcm
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -114,6 +115,16 @@ class RtpSession:
         self._first_packet = True
 
         self._tx_buffer = bytearray()
+        # Extra TX inputs (conference bridge legs). Unlike ``_tx_buffer``,
+        # which is one FIFO owned by the active AudioSource, each producer
+        # gets its own queue and they are summed into the outgoing frame.
+        self._tx_mix = MixInputs()
+        # Called once per 20 ms sender tick while media is running with
+        # (local_frame, sent_frame): ``local_frame`` is the PCM that came
+        # from this line's own TX source (None when idle) and ``sent_frame``
+        # is what actually went on the wire (None when nothing was sent,
+        # e.g. on hold or during DTMF). Used by bridging and monitoring.
+        self.on_tx_frame: Callable[[bytes | None, bytes | None], None] | None = None
         self._dtmf_queue: list[str] = []
         self._dtmf_active = False
         self._dtmf_event = -1
@@ -316,6 +327,7 @@ class RtpSession:
             self._transport.close()
             self._transport = None
         self._tx_buffer.clear()
+        self._tx_mix.clear()
         self._clear_dtmf_tx()
         self._rx_dtmf_timestamp = -1
         self.reset_byte_counters()
@@ -336,6 +348,20 @@ class RtpSession:
         if len(self._tx_buffer) > self._tx_buffer_max:
             overflow = len(self._tx_buffer) - self._tx_buffer_max
             del self._tx_buffer[:overflow]
+
+    def push_mix_audio(self, key: str, pcm_le: bytes) -> None:
+        """Queue PCM from an extra producer to be mixed into the TX stream.
+
+        ``key`` names the producer; audio from different keys is summed with
+        the regular TX audio instead of being queued behind it.
+        """
+        if self._transport is None:
+            return
+        self._tx_mix.push(key, pcm_le, self._pcm_frame_bytes)
+
+    def remove_mix_input(self, key: str) -> None:
+        """Forget an extra TX producer and whatever it still had queued."""
+        self._tx_mix.remove(key)
 
     def flush_tx_buffer(self) -> None:
         """Drop queued PCM not yet sent (e.g. after barge-in)."""
@@ -436,15 +462,32 @@ class RtpSession:
         while True:
             next_t += FRAME_SEC
             try:
+                local: bytes | None = None
+                sent: bytes | None = None
                 if self._remote is not None and self.tx_enabled:
                     if self._dtmf_active or self._dtmf_queue:
                         self._send_dtmf_packet()
-                    elif len(self._tx_buffer) >= self._pcm_frame_bytes:
-                        frame = bytes(self._tx_buffer[: self._pcm_frame_bytes])
-                        del self._tx_buffer[: self._pcm_frame_bytes]
-                        self._send_audio_packet(frame)
-                    elif self.send_silence:
-                        self._send_audio_packet(self._silence_frame())
+                    else:
+                        if len(self._tx_buffer) >= self._pcm_frame_bytes:
+                            local = bytes(self._tx_buffer[: self._pcm_frame_bytes])
+                            del self._tx_buffer[: self._pcm_frame_bytes]
+                        extra = (
+                            self._tx_mix.pop(self._pcm_frame_bytes)
+                            if self._tx_mix
+                            else None
+                        )
+                        if local is not None and extra is not None:
+                            sent = mix_pcm(local, extra)
+                        elif local is not None:
+                            sent = local
+                        elif extra is not None:
+                            sent = extra
+                        elif self.send_silence:
+                            sent = self._silence_frame()
+                        if sent is not None:
+                            self._send_audio_packet(sent)
+                if self.on_tx_frame is not None:
+                    self.on_tx_frame(local, sent)
             except Exception:  # noqa: BLE001 - never let pacing die mid-call
                 _LOGGER.exception("RTP send error")
             delay = next_t - self._loop.time()

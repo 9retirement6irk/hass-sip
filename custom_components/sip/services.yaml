@@ -248,6 +248,13 @@ start_assist:
       default: false
       selector:
         boolean:
+    listen_while_speaking:
+      name: Listen while speaking
+      description: Keep listening while Assist talks, without interrupting it. Speech the caller starts during a reply is kept and answered once the reply has finished; noise never cuts a reply short. Takes precedence over barge-in (requires pymicro_vad; default false).
+      required: false
+      default: false
+      selector:
+        boolean:
     silence_seconds:
       name: Silence timeout
       description: Seconds of silence that end a spoken command. Assist defaults to 0.7; phone lines usually need 1.0-1.5 so callers are not cut off mid-sentence.
@@ -341,3 +348,19 @@ start_assist:
       selector:
         text:
           type: password
+
+bridge:
+  name: Conference lines
+  description: Merge the active calls of two or more phone lines into one conference. Everybody hears everybody, including Assist or media playing on any of the lines. The conference ends for a line when its call ends or when it is unbridged.
+  target:
+    entity:
+      integration: sip
+      domain: media_player
+
+unbridge:
+  name: Split conference
+  description: Take the targeted phone lines out of any conference. Their calls stay connected, separately.
+  target:
+    entity:
+      integration: sip
+      domain: media_player

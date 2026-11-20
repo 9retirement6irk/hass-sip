@@ -56,6 +56,8 @@ SERVICES = {
     "start_recording",
     "stop_recording",
     "start_assist",
+    "bridge",
+    "unbridge",
 }
 
 # (platform, unique-id suffix) for every entity the account creates.

@@ -22,6 +22,7 @@ from . import codecs
 from . import sip_message as sm
 from . import trace
 from .audio import AudioSink, AudioSource, NullSink, TeeSink
+from .mixing import MixInputs, mix_pcm
 from .rtp_session import RtpSession
 from .sip_auth import digest_response
 
@@ -383,6 +384,14 @@ class SipClient:
         self.rtp.media_timeout = float(self.config.media_timeout)
         self.rtp.on_media_timeout = self._on_media_timeout
         self.sink: AudioSink = TeeSink()
+        # Conference bridging / monitoring hooks (see bridge.py, monitor.py).
+        # RX taps get the far end's audio exactly as received; ``_rx_mix``
+        # holds audio from bridged lines that the sinks (Assist, recorder)
+        # should hear in addition to it. TX taps mirror RtpSession.on_tx_frame.
+        self._rx_taps: list[Callable[[bytes], None]] = []
+        self._rx_mix = MixInputs()
+        self._tx_taps: list[Callable[[bytes | None, bytes | None], None]] = []
+        self.rtp.on_tx_frame = self._on_tx_frame
         self._tx_source_task: asyncio.Task | None = None
         # A cancelled source may still be cleaning up an ffmpeg subprocess.
         # Keep it alive until that cleanup has actually completed.
@@ -2040,10 +2049,52 @@ class SipClient:
         self._media_owner = None
 
     def _on_rx_audio(self, pcm_le: bytes) -> None:
+        for tap in list(self._rx_taps):
+            try:
+                tap(pcm_le)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("RX tap error")
+        if self._rx_mix:
+            extra = self._rx_mix.pop(len(pcm_le))
+            if extra is not None:
+                pcm_le = mix_pcm(pcm_le, extra)
         try:
             self.sink.write(pcm_le)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Audio sink error")
+
+    def _on_tx_frame(self, local: bytes | None, sent: bytes | None) -> None:
+        for tap in list(self._tx_taps):
+            try:
+                tap(local, sent)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("TX tap error")
+
+    # -- bridging / monitoring hooks ------------------------------------
+    def add_rx_tap(self, tap: Callable[[bytes], None]) -> None:
+        """Receive the far end's PCM as it arrives (before any mixing)."""
+        if tap not in self._rx_taps:
+            self._rx_taps.append(tap)
+
+    def remove_rx_tap(self, tap: Callable[[bytes], None]) -> None:
+        if tap in self._rx_taps:
+            self._rx_taps.remove(tap)
+
+    def add_tx_tap(self, tap: Callable[[bytes | None, bytes | None], None]) -> None:
+        """Receive ``(local_frame, sent_frame)`` once per 20 ms TX tick."""
+        if tap not in self._tx_taps:
+            self._tx_taps.append(tap)
+
+    def remove_tx_tap(self, tap: Callable[[bytes | None, bytes | None], None]) -> None:
+        if tap in self._tx_taps:
+            self._tx_taps.remove(tap)
+
+    def push_rx_mix(self, key: str, pcm_le: bytes) -> None:
+        """Let the sinks (Assist, recorder) also hear audio from ``key``."""
+        self._rx_mix.push(key, pcm_le, self._codec.pcm_frame_bytes)
+
+    def remove_rx_mix(self, key: str) -> None:
+        self._rx_mix.remove(key)
 
     def _on_rx_dtmf(self, c: str) -> None:
         self._emit("on_dtmf", c)

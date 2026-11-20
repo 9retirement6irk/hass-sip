@@ -83,7 +83,9 @@ from .repairs import (
     register_auth_issue_id,
     should_open_auth_repair,
 )
+from .listen import async_setup_listen
 from .sip_client.audio import FfmpegAudioSource
+from .sip_client.bridge import CallBridge
 from .sip_client.sip_client import SipCallbacks, SipClient, SipConfig, SipState
 from .sip_client.trace import mask_number
 
@@ -119,6 +121,20 @@ def _fire_assist_rejected(
     async_dispatcher_send(
         hass, f"{DOMAIN}_event_{entry_id}", EVENT_SIP_ASSIST_REJECTED, extra
     )
+
+
+_DATA_BRIDGES = f"{DOMAIN}_bridges"
+
+
+def _stop_bridges_for(hass: HomeAssistant, client: SipClient) -> int:
+    """Stop every conference bridge that involves ``client``."""
+    bridges: list[CallBridge] = hass.data.get(_DATA_BRIDGES, [])
+    stopped = 0
+    for bridge in [b for b in bridges if b.involves(client)]:
+        bridge.stop()
+        bridges.remove(bridge)
+        stopped += 1
+    return stopped
 
 
 def _sip_device_id(hass: HomeAssistant, entry_id: str) -> str | None:
@@ -508,6 +524,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             assist_bridge = None
         recorder = close_recorder_slot(entry.runtime_data)
         client.clear_sinks()
+        # A conference ends for this line when its call does; the other
+        # line's call carries on by itself.
+        _stop_bridges_for(hass, client)
         if recorder is not None:
             entry_id = entry.entry_id
 
@@ -669,6 +688,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         max_turns: int = 0,
         max_silent_turns: int = 2,
         barge_in: bool = False,
+        listen_while_speaking: bool = False,
         silence_seconds: float | None = None,
         noise_suppression: int = 0,
         turn_tone: bool = False,
@@ -696,6 +716,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             max_turns=max_turns,
             max_silent_turns=max_silent_turns,
             barge_in=barge_in,
+            listen_while_speaking=listen_while_speaking,
             silence_seconds=silence_seconds,
             noise_suppression=noise_suppression,
             turn_tone=turn_tone,
@@ -756,6 +777,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         await async_register_services(hass)
+        await async_setup_listen(hass)
     except BaseException:
         await _async_stop_client(entry_data)
         raise
@@ -786,6 +808,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry_data = getattr(entry, "runtime_data", None)
     LOGGER.info("Unloading SIP account %s", entry.data.get(CONF_USERNAME))
     if entry_data:
+        if entry_data.get("client") is not None:
+            _stop_bridges_for(hass, entry_data["client"])
         await _async_stop_client(entry_data)
 
         set_ivr = entry_data.get("set_ivr")
@@ -814,6 +838,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "start_recording",
                 "stop_recording",
                 "start_assist",
+                "bridge",
+                "unbridge",
             ]:
                 try:
                     hass.services.async_remove(DOMAIN, service)
@@ -1156,6 +1182,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 "max_turns",
                 "max_silent_turns",
                 "barge_in",
+                "listen_while_speaking",
                 "silence_seconds",
                 "noise_suppression",
                 "turn_tone",
@@ -1216,7 +1243,46 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 data["set_ivr"](None)
             await data["trigger_assist_fn"](**opts)
 
+    async def handle_bridge(call: ServiceCall) -> None:
+        """Conference the active calls of two or more lines together."""
+        targets = await get_client_entries(call)
+        clients: list[SipClient] = []
+        for _entry_id, data in targets:
+            client = data.get("client")
+            if client is not None and client not in clients:
+                clients.append(client)
+        if len(clients) < 2:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="bridge_needs_two_lines"
+            )
+        if not all(client.in_call for client in clients):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="bridge_not_in_call"
+            )
+        bridges: list[CallBridge] = hass.data.setdefault(_DATA_BRIDGES, [])
+        for i, first in enumerate(clients):
+            for second in clients[i + 1 :]:
+                if any(b.involves(first) and b.involves(second) for b in bridges):
+                    continue
+                bridge = CallBridge(first, second)
+                bridge.start()
+                bridges.append(bridge)
+
+    async def handle_unbridge(call: ServiceCall) -> None:
+        """Take the targeted lines out of any conference; calls stay up."""
+        targets = await get_client_entries(call)
+        for _entry_id, data in targets:
+            client = data.get("client")
+            if client is not None:
+                _stop_bridges_for(hass, client)
+
     # Register all services
+    hass.services.async_register(
+        DOMAIN, "bridge", handle_bridge, schema=SERVICE_GENERIC_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, "unbridge", handle_unbridge, schema=SERVICE_GENERIC_SCHEMA
+    )
     hass.services.async_register(
         DOMAIN, "dial", handle_dial, schema=SERVICE_DIAL_SCHEMA
     )

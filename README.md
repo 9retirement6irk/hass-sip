@@ -91,6 +91,48 @@ target:
 - **Intercom auto-answer**: Set `{"102": {"name": "Front Doorbell", "auto_answer": true}}` in `sip_contacts.json` to answer a door station immediately ([details](docs/examples.md#intercom--auto-answer-mode)).
 - **Outgoing TTS**: An automation dials a phone, speaks the message after the call is answered, then hangs up (`sip.dial`'s `message`, [example](docs/examples.md#example-announce-a-tts-message-then-hang-up)).
 
+### Fork additions: listen in, conference, listen while speaking
+
+This fork adds three things on top of upstream:
+
+**Listen in from the browser.** A dashboard card plays a line's call live
+(both directions, listen-only, admins only). The card is loaded
+automatically:
+
+```yaml
+type: custom:sip-listen-card
+entity: media_player.sip_1_phone_line
+name: Line 1
+```
+
+**Conference calls.** `sip.bridge` merges the active calls of two or more
+lines; `sip.unbridge` splits them again without hanging up. To add a new
+party to a call, dial it on a free line and bridge the two:
+
+```yaml
+- action: sip.dial
+  target: {entity_id: media_player.sip_2_phone_line}
+  data: {number: "5551234567"}
+- wait_for_trigger:
+    - trigger: state
+      entity_id: binary_sensor.sip_2_call_active
+      to: "on"
+- action: sip.bridge
+  target:
+    entity_id:
+      - media_player.sip_1_phone_line
+      - media_player.sip_2_phone_line
+```
+
+Everybody hears everybody, including Assist or media on any bridged line,
+and Assist hears every party. A conference ends for a line when its call
+ends.
+
+**Listen while speaking.** `listen_while_speaking: true` on
+`sip.start_assist` keeps Assist listening during its own replies without
+letting the caller cut it off: background noise is ignored, and speech the
+caller starts mid-reply is kept and answered as soon as the reply finishes.
+
 ## ESPHome external component
 
 Looking to build a DIY physical endpoint — such as an ESP32 intercom, doorbell, or paging speaker?

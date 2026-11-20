@@ -4,6 +4,144 @@
  *   entity: media_player.sip_4_phone_line
  *   name: Line 1            # optional
  */
+// ---- smooth PCM playback for listen-in ----
+// A jitter buffer that plays continuously (instead of one short buffer per
+// network message, which crackles and gaps). It starts ~250 ms behind live and
+// grows its delay a little each time the network stalls, up to 600 ms.
+class SipPcmRing {
+  constructor(rate) {
+    this.rate = rate;
+    this.size = Math.ceil(rate * 2);
+    this.buf = new Float32Array(this.size);
+    this.r = 0;
+    this.n = 0;
+    this.target = Math.round(rate * 0.25);
+    this.max = Math.round(rate * 0.6);
+    this.playing = false;
+  }
+  push(d) {
+    for (let i = 0; i < d.length; i++) {
+      this.buf[(this.r + this.n) % this.size] = d[i];
+      if (this.n < this.size) this.n++;
+      else this.r = (this.r + 1) % this.size;
+    }
+    // clock drift or a burst after a stall: skip ahead instead of lagging more
+    const cap = this.target + Math.round(this.rate * 0.4);
+    if (this.n > cap) {
+      const drop = this.n - this.target;
+      this.r = (this.r + drop) % this.size;
+      this.n -= drop;
+    }
+  }
+  pull(out) {
+    if (!this.playing && this.n >= this.target) this.playing = true;
+    for (let i = 0; i < out.length; i++) {
+      if (this.playing && this.n > 0) {
+        out[i] = this.buf[this.r];
+        this.r = (this.r + 1) % this.size;
+        this.n--;
+      } else {
+        out[i] = 0;
+        if (this.playing) {
+          // ran dry: wait for a bigger cushion before playing again
+          this.playing = false;
+          this.target = Math.min(this.max, this.target + Math.round(this.rate * 0.05));
+        }
+      }
+    }
+  }
+}
+
+const SIP_PCM_WORKLET = `${SipPcmRing.toString()}
+class SipPcmPlayerProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ring = new SipPcmRing(sampleRate);
+    this.port.onmessage = (e) => this.ring.push(e.data);
+  }
+  process(inputs, outputs) {
+    const ch = outputs[0];
+    this.ring.pull(ch[0]);
+    for (let c = 1; c < ch.length; c++) ch[c].set(ch[0]);
+    return true;
+  }
+}
+registerProcessor("sip-pcm-player", SipPcmPlayerProcessor);`;
+
+// Must be called from a click/tap handler (browsers only start audio then).
+async function sipCreatePcmPlayer() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx({ latencyHint: "playback" });
+  const resumed = ctx.resume(); // before any await, while the tap still counts
+  let node = null;
+  let ring = null;
+  // AudioWorklet needs https; over plain http fall back to ScriptProcessor
+  if (ctx.audioWorklet && window.isSecureContext && typeof AudioWorkletNode !== "undefined") {
+    const url = URL.createObjectURL(new Blob([SIP_PCM_WORKLET], { type: "application/javascript" }));
+    try {
+      await ctx.audioWorklet.addModule(url);
+      node = new AudioWorkletNode(ctx, "sip-pcm-player", { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+    } catch (e) {
+      node = null;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+  if (!node) {
+    ring = new SipPcmRing(ctx.sampleRate);
+    node = ctx.createScriptProcessor(2048, 1, 1);
+    node.onaudioprocess = (e) => ring.pull(e.outputBuffer.getChannelData(0));
+  }
+  node.connect(ctx.destination);
+  await resumed;
+  const outRate = ctx.sampleRate;
+  // stateful linear resampler, so chunk boundaries join without clicks
+  const st = { rate: 0, pos: 0, last: 0 };
+  return {
+    push(b64, rate) {
+      const raw = atob(b64);
+      const n = raw.length >> 1;
+      if (!n || !rate) return 0;
+      const input = new Float32Array(n);
+      let peak = 0;
+      for (let i = 0; i < n; i++) {
+        let s = raw.charCodeAt(2 * i) | (raw.charCodeAt(2 * i + 1) << 8);
+        if (s >= 32768) s -= 65536;
+        const v = s / 32768;
+        input[i] = v;
+        const a = v < 0 ? -v : v;
+        if (a > peak) peak = a;
+      }
+      if (rate !== st.rate) { st.rate = rate; st.pos = 0; st.last = input[0]; }
+      let out = input;
+      if (rate !== outRate) {
+        const step = rate / outRate;
+        out = new Float32Array(Math.ceil((n - st.pos) / step) + 1);
+        let k = 0;
+        let p = st.pos;
+        while (p < n) {
+          const i = Math.floor(p);
+          const f = p - i;
+          const a = i === 0 ? st.last : input[i - 1];
+          const b = input[i];
+          out[k++] = a + (b - a) * f;
+          p += step;
+        }
+        st.pos = p - n;
+        out = out.subarray(0, k);
+      }
+      st.last = input[n - 1];
+      if (ring) ring.push(out);
+      else node.port.postMessage(out.slice());
+      return peak;
+    },
+    close() {
+      try { node.disconnect(); } catch (e) { /* already */ }
+      try { const p = ctx.close(); if (p && p.catch) p.catch(() => {}); } catch (e) { /* closed */ }
+    },
+  };
+}
+
 class SipListenCard extends HTMLElement {
   setConfig(config) {
     if (!config || !config.entity) {
@@ -86,17 +224,17 @@ class SipListenCard extends HTMLElement {
   async _start() {
     this._error = "";
     this._starting = true;
+    // created right here, inside the tap, so the browser lets it play
+    const ready = sipCreatePcmPlayer();
+    this._ready = ready;
     this._update();
     try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      this._ctx = new Ctx();
-      await this._ctx.resume();
-      this._nextTime = 0;
+      this._player = await ready;
       const unsub = await this._hass.connection.subscribeMessage(
         (event) => this._onAudio(event),
         { type: "sip/listen", entity_id: this._config.entity }
       );
-      if (!this._starting) {
+      if (!this._starting || this._ready !== ready) {
         unsub();
         return;
       }
@@ -126,10 +264,10 @@ class SipListenCard extends HTMLElement {
   }
 
   _closeAudio() {
-    if (this._ctx) {
-      this._ctx.close().catch(() => {});
-      this._ctx = null;
-    }
+    const ready = this._ready;
+    this._ready = null;
+    this._player = null;
+    if (ready) ready.then((p) => p.close()).catch(() => {});
   }
 
   _setLevel(value) {
@@ -138,35 +276,8 @@ class SipListenCard extends HTMLElement {
   }
 
   _onAudio(event) {
-    const ctx = this._ctx;
-    if (!ctx || !event || !event.pcm) return;
-    const raw = atob(event.pcm);
-    const count = raw.length >> 1;
-    if (!count) return;
-    const buffer = ctx.createBuffer(1, count, event.rate);
-    const data = buffer.getChannelData(0);
-    let peak = 0;
-    for (let i = 0; i < count; i++) {
-      let sample = raw.charCodeAt(2 * i) | (raw.charCodeAt(2 * i + 1) << 8);
-      if (sample >= 32768) sample -= 65536;
-      const value = sample / 32768;
-      data[i] = value;
-      const abs = value < 0 ? -value : value;
-      if (abs > peak) peak = abs;
-    }
-    this._setLevel(Math.sqrt(peak));
-
-    const now = ctx.currentTime;
-    // Start a little ahead so network jitter does not cause gaps, and jump
-    // back to "now" if a stall let the queue grow into noticeable delay.
-    if (this._nextTime < now + 0.02 || this._nextTime > now + 0.6) {
-      this._nextTime = now + 0.12;
-    }
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    source.start(this._nextTime);
-    this._nextTime += buffer.duration;
+    if (!this._player || !event || !event.pcm) return;
+    this._setLevel(Math.sqrt(this._player.push(event.pcm, event.rate)));
   }
 }
 

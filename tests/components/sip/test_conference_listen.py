@@ -117,8 +117,8 @@ async def test_monitor_mixes_both_directions_and_detaches():
     client._on_tx_frame(None, None)
     assert frames[-1] == (b"\x00" * 320, 8000)
 
-    client._on_rx_audio(_pcm(40))
-    client._on_rx_audio(_pcm(40))
+    for _ in range(3):  # the monitor waits for a 60 ms cushion
+        client._on_rx_audio(_pcm(40))
     client._on_tx_frame(_pcm(2), _pcm(2))
     assert _first(frames[-1][0]) == 42
 

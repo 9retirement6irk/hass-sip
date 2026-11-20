@@ -307,6 +307,10 @@
           "name": "Barge-in",
           "description": "Allow interrupting TTS responses by speaking (requires pymicro_vad; default false; may self-trigger on speakerphones without echo cancellation)."
         },
+        "include_call_start": {
+          "name": "Include call start",
+          "description": "Start the first turn with the audio heard since the call connected (up to 4 s), so words said at pickup, before Assist was listening, are not lost. Use on outgoing calls; only the first Assist on a call can use it."
+        },
         "listen_while_speaking": {
           "name": "Listen while speaking",
           "description": "Keep listening while Assist talks, without interrupting it. Speech the caller starts during a reply is kept and answered once the reply has finished; noise never cuts a reply short. Takes precedence over barge-in (requires pymicro_vad; default false)."

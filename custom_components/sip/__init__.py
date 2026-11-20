@@ -34,7 +34,7 @@ from homeassistant.helpers.service import async_extract_config_entry_ids
 
 from homeassistant.components.assist_pipeline import async_get_pipeline
 
-from .assist import AssistBridge
+from .assist import AssistBridge, CallStartBuffer
 from .assist_gate import (
     REASON_NOT_ALLOWED,
     PinCollector,
@@ -135,6 +135,8 @@ def _fire_assist_rejected(
 
 _DATA_BRIDGES = f"{DOMAIN}_bridges"
 _TRANSCRIPT_MAX_TURNS = 500
+# Audio kept from the moment a call connects, for include_call_start.
+_CALL_START_BUFFER_SECONDS = 4.0
 
 
 @callback
@@ -511,6 +513,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         LOGGER.info("[%s] Call connected", sip_config.username)
         entry.runtime_data["call_connect_time"] = time.time()
         entry.runtime_data["call_status"] = "answered"
+        entry.runtime_data["caller_heard_at"] = None
+        # Hold the first seconds of the call so sip.start_assist
+        # (include_call_start) can hear what was said at pickup.
+        old_buffer = entry.runtime_data.pop("call_start_buffer", None)
+        if old_buffer is not None:
+            client.remove_sink(old_buffer)
+        start_buffer = CallStartBuffer(
+            int(client.codec.sample_rate * 2 * _CALL_START_BUFFER_SECONDS)
+        )
+        entry.runtime_data["call_start_buffer"] = start_buffer
+        client.add_sink(start_buffer)
         fire_sip_event(EVENT_SIP_CALL_CONNECTED)
         nonlocal ivr_session
         if ivr_session is not None:
@@ -520,6 +533,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @callback
     def on_call_ended(reason: str = "local") -> None:
         LOGGER.info("[%s] Call ended (%s)", sip_config.username, reason)
+        entry.runtime_data.pop("call_start_buffer", None)
         collector = entry.runtime_data.get("pin_collector")
         if collector is not None:
             collector.fail()
@@ -732,6 +746,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as err:
             LOGGER.error("Failed to play audio file: %s", err)
 
+    @callback
+    def on_caller_speech() -> None:
+        """Assist heard the caller talking; expose when, for automations."""
+        entry.runtime_data["caller_heard_at"] = time.time()
+        async_dispatcher_send(hass, f"{DOMAIN}_state_update_{entry.entry_id}")
+
     # Helper function to trigger Assist bridge
     async def trigger_assist_internal(
         pipeline_id: str | None = None,
@@ -752,6 +772,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hangup_on_end: bool = False,
         allow_llm_hangup: bool = False,
         interrupt_media: bool = True,
+        include_call_start: bool = False,
     ) -> None:
         nonlocal assist_bridge
         if assist_bridge is not None:
@@ -792,7 +813,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             on_turn_fn=lambda cid, role, text: record_transcript(
                 entry.runtime_data, cid, role, text
             ),
+            on_speech_fn=on_caller_speech,
         )
+        start_buffer = entry.runtime_data.pop("call_start_buffer", None)
+        if start_buffer is not None:
+            # Only the first Assist on a call can use it; later ones would
+            # hear audio an earlier one already answered.
+            client.remove_sink(start_buffer)
+            if include_call_start:
+                bridge.seed_preroll(start_buffer.take())
 
         def on_assist_done() -> None:
             nonlocal assist_bridge
@@ -1308,6 +1337,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 "hangup_on_end",
                 "allow_llm_hangup",
                 "interrupt_media",
+                "include_call_start",
             )
             if k in call.data
         }

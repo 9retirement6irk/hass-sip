@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import time
 from typing import Any
 
@@ -29,6 +30,13 @@ from .helpers import (
 from .media_status import media_view
 from .sip_client.audio import FfmpegAudioSource
 from .sip_client.sip_client import SipClient, SipState
+
+
+def _iso(ts: float | None) -> str | None:
+    """Epoch seconds as an ISO 8601 UTC string, or None."""
+    if not ts:
+        return None
+    return datetime.datetime.fromtimestamp(ts, datetime.UTC).isoformat()
 
 
 async def async_setup_entry(
@@ -149,6 +157,7 @@ class SipMediaPlayer(MediaPlayerEntity):
             "bytes_sent": view["bytes_sent"],
             "audio_path": view["audio_path"],
             "last_end_reason": view["last_end_reason"],
+            "caller_heard_at": _iso(self.entry_data.get("caller_heard_at")),
         }
 
     # -- controls -------------------------------------------------------

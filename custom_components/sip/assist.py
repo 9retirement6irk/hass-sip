@@ -234,6 +234,32 @@ class _OnStartSource(AudioSource):
         await self._inner.run(inner_push, is_active)
 
 
+class CallStartBuffer(AudioSink):
+    """Keep the last few seconds of RX audio from the start of a call.
+
+    Attached when a call connects. ``sip.start_assist`` with
+    ``include_call_start`` takes it and hands it to the new bridge, so what
+    the other side says in the moment between pickup and Assist listening is
+    heard instead of dropped.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max = max(0, int(max_bytes))
+        self._buf = bytearray()
+
+    def write(self, pcm_le: bytes) -> None:
+        self._buf.extend(pcm_le)
+        extra = len(self._buf) - self._max
+        if extra > 0:
+            del self._buf[:extra]
+
+    def take(self) -> bytes:
+        """Return the buffered audio and empty the buffer."""
+        data = bytes(self._buf)
+        self._buf.clear()
+        return data
+
+
 class AssistBridge(AudioSink):
     """Bridges RTP incoming audio to Assist pipeline and plays back responses."""
 
@@ -269,6 +295,7 @@ class AssistBridge(AudioSink):
         user_id: str | None = None,
         device_id: str | None = None,
         on_turn_fn: Callable[[str | None, str, str], None] | None = None,
+        on_speech_fn: Callable[[], None] | None = None,
     ) -> None:
         """Initialize the Assist bridge."""
         self.hass = hass
@@ -322,6 +349,10 @@ class AssistBridge(AudioSink):
         # Called with (conversation_id, role, text) for each recognised caller
         # utterance ("caller") and each spoken reply ("assistant").
         self.on_turn = on_turn_fn
+        # Called when the pipeline hears the caller start talking (VAD) and
+        # when an utterance has been recognised, so automations can tell the
+        # caller is (or was just) speaking.
+        self.on_speech = on_speech_fn
 
         if self.barge_in and MicroVad is None:
             LOGGER.warning(
@@ -1100,7 +1131,11 @@ class AssistBridge(AudioSink):
         elif event.type == PipelineEventType.INTENT_PROGRESS:
             if event.data and event.data.get("tts_start_streaming"):
                 self._begin_tts_playback(self._run_tts_token)
+        elif event.type == PipelineEventType.STT_VAD_START:
+            self._report_speech()
         elif event.type == PipelineEventType.STT_END:
+            if _stt_text(event.data).strip():
+                self._report_speech()
             LOGGER.debug(
                 "Assist turn %d recognized: %r",
                 self._turn_index,
@@ -1130,6 +1165,25 @@ class AssistBridge(AudioSink):
                 self._turn_error = event.data.get("code")
             LOGGER.error("Assist pipeline error: %s", event.data)
             self._abort_streamed_tts()
+
+    def seed_preroll(self, pcm_le: bytes) -> None:
+        """Hand audio heard before this bridge started to its first turn.
+
+        ``pcm_le`` is call-rate PCM (as ``write`` receives it). It is treated
+        like barge-in audio: the first listening turn skips the turn tone and
+        starts with it, so words said before Assist was attached (e.g. the
+        "Hello?" when an outgoing call is picked up) are not lost.
+        """
+        if pcm_le:
+            self._barge_in_preroll = self._to_16k(pcm_le)
+
+    def _report_speech(self) -> None:
+        if self.on_speech is None:
+            return
+        try:
+            self.on_speech()
+        except Exception:  # noqa: BLE001 - never let a listener break a turn
+            LOGGER.exception("Assist speech callback failed")
 
     def _report_turn(self, role: str, text: str) -> None:
         """Pass one transcript line to the owner; never let it break a turn."""

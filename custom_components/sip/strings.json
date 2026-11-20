@@ -362,6 +362,16 @@
     "unbridge": {
       "name": "Split conference",
       "description": "Takes the targeted phone lines out of any conference; their calls stay connected."
+    },
+    "get_transcript": {
+      "name": "Get transcript",
+      "description": "Returns what was said in the phone line's latest Assist conversation.",
+      "fields": {
+        "conversation_id": {
+          "name": "Conversation ID",
+          "description": "Only return the transcript if it belongs to this conversation."
+        }
+      }
     }
   },
   "issues": {

@@ -364,3 +364,18 @@ unbridge:
     entity:
       integration: sip
       domain: media_player
+
+get_transcript:
+  name: Get transcript
+  description: Return what was said in the phone line's latest Assist conversation (caller speech as recognised, and the spoken replies). Kept after the call ends until the next conversation on that line starts.
+  target:
+    entity:
+      integration: sip
+      domain: media_player
+  fields:
+    conversation_id:
+      name: Conversation ID
+      description: Optional. Only return the transcript if it belongs to this conversation.
+      required: false
+      selector:
+        text:

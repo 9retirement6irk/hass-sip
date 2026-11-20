@@ -234,3 +234,61 @@ async def test_listen_websocket_streams_call_audio(
 
     await ws.send_json({"id": 3, "type": "sip/listen", "entity_id": "sensor.nope"})
     assert not (await ws.receive_json())["success"]
+
+
+def test_assist_reports_caller_and_reply_turns():
+    assist_mod, _, _, _ = _assist_ctx()
+    turns: list[tuple] = []
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        on_turn_fn=lambda cid, role, text: turns.append((cid, role, text)),
+    )
+    events = assist_mod.PipelineEventType
+    bridge._on_pipeline_event(
+        MagicMock(type=events.RUN_START, data={"conversation_id": "c1"})
+    )
+    bridge._on_pipeline_event(
+        MagicMock(type=events.STT_END, data={"stt_output": {"text": " Hello? "}})
+    )
+    bridge._on_pipeline_event(MagicMock(type=events.STT_END, data={}))
+    bridge._on_pipeline_event(
+        MagicMock(
+            type=events.INTENT_END,
+            data={
+                "intent_output": {
+                    "response": {"speech": {"plain": {"speech": "Hi dear"}}}
+                }
+            },
+        )
+    )
+    assert turns == [("c1", "caller", "Hello?"), ("c1", "assistant", "Hi dear")]
+
+
+async def test_get_transcript_service_returns_latest_conversation(
+    hass: HomeAssistant, init_integration
+) -> None:
+    from custom_components.sip import record_transcript
+
+    data = init_integration.runtime_data
+    record_transcript(data, "old", "caller", "ignored")
+    record_transcript(data, "conv", "caller", "Hello?")
+    record_transcript(data, "conv", "assistant", "Hi dear")
+    target = phone_line(hass, init_integration)
+    result = await hass.services.async_call(
+        DOMAIN, "get_transcript", target, blocking=True, return_response=True
+    )
+    assert result["conversation_id"] == "conv"
+    assert [(t["role"], t["text"]) for t in result["turns"]] == [
+        ("caller", "Hello?"),
+        ("assistant", "Hi dear"),
+    ]
+    other = await hass.services.async_call(
+        DOMAIN,
+        "get_transcript",
+        {**target, "conversation_id": "nope"},
+        blocking=True,
+        return_response=True,
+    )
+    assert other["turns"] == []

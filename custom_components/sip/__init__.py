@@ -12,7 +12,13 @@ import voluptuous as vol
 from homeassistant.auth.permissions.const import CAT_ENTITIES, POLICY_CONTROL
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
-from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+    callback,
+)
 from homeassistant.exceptions import (
     ServiceValidationError,
     Unauthorized,
@@ -124,6 +130,34 @@ def _fire_assist_rejected(
 
 
 _DATA_BRIDGES = f"{DOMAIN}_bridges"
+_TRANSCRIPT_MAX_TURNS = 500
+
+
+@callback
+def record_transcript(
+    runtime_data: dict[str, Any], conversation_id: str | None, role: str, text: str
+) -> None:
+    """Append one Assist turn to the line's transcript.
+
+    One transcript per line: it starts over when a different conversation
+    begins and is kept after the call ends, so it can still be read then.
+    """
+    transcript = runtime_data.get("transcript")
+    if transcript is None or transcript.get("conversation_id") != conversation_id:
+        transcript = runtime_data["transcript"] = {
+            "conversation_id": conversation_id,
+            "turns": [],
+        }
+    turns = transcript["turns"]
+    turns.append(
+        {
+            "role": role,
+            "text": text,
+            "time": datetime.datetime.now(datetime.UTC).isoformat(),
+        }
+    )
+    if len(turns) > _TRANSCRIPT_MAX_TURNS:
+        del turns[: len(turns) - _TRANSCRIPT_MAX_TURNS]
 
 
 def _stop_bridges_for(hass: HomeAssistant, client: SipClient) -> int:
@@ -260,6 +294,10 @@ SERVICE_RECORDING_SCHEMA = cv.make_entity_service_schema(
 )
 
 SERVICE_GENERIC_SCHEMA = cv.make_entity_service_schema({})
+
+SERVICE_TRANSCRIPT_SCHEMA = cv.make_entity_service_schema(
+    {vol.Optional("conversation_id"): cv.string}
+)
 
 SERVICE_ASSIST_SCHEMA = cv.make_entity_service_schema(
     {
@@ -734,6 +772,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ),
             user_id=assist_user_id,
             device_id=_sip_device_id(hass, entry.entry_id),
+            on_turn_fn=lambda cid, role, text: record_transcript(
+                entry.runtime_data, cid, role, text
+            ),
         )
 
         def on_assist_done() -> None:
@@ -840,6 +881,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "start_assist",
                 "bridge",
                 "unbridge",
+                "get_transcript",
             ]:
                 try:
                     hass.services.async_remove(DOMAIN, service)
@@ -1243,6 +1285,21 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 data["set_ivr"](None)
             await data["trigger_assist_fn"](**opts)
 
+    async def handle_get_transcript(call: ServiceCall) -> ServiceResponse:
+        """Return what was said in the line's latest Assist conversation."""
+        targets = await get_client_entries(call)
+        if not targets:
+            return {"conversation_id": None, "turns": []}
+        _entry_id, data = targets[0]
+        transcript = data.get("transcript") or {"conversation_id": None, "turns": []}
+        wanted = call.data.get("conversation_id")
+        if wanted and transcript.get("conversation_id") != wanted:
+            return {"conversation_id": wanted, "turns": []}
+        return {
+            "conversation_id": transcript.get("conversation_id"),
+            "turns": [dict(turn) for turn in transcript["turns"]],
+        }
+
     async def handle_bridge(call: ServiceCall) -> None:
         """Conference the active calls of two or more lines together."""
         targets = await get_client_entries(call)
@@ -1277,6 +1334,13 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 _stop_bridges_for(hass, client)
 
     # Register all services
+    hass.services.async_register(
+        DOMAIN,
+        "get_transcript",
+        handle_get_transcript,
+        schema=SERVICE_TRANSCRIPT_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
     hass.services.async_register(
         DOMAIN, "bridge", handle_bridge, schema=SERVICE_GENERIC_SCHEMA
     )
